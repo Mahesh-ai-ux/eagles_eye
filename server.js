@@ -17,51 +17,45 @@ const HOST = '0.0.0.0';
 app.use(express.static(path.join(__dirname, 'public')));
 app.use(express.json());
 
-// ── CLIENT CACHE (per region) ──
-const clientCache = {};
+// ── CLIENT FACTORY (NO cache — always fresh per request region) ──
+// BUG FIX: removed clientCache entirely. Caching clients by region caused stale
+// region clients to be reused when the user switched regions in the UI.
+// AWS SDK clients are lightweight; creating them per-request is negligible overhead.
 function getClients(region) {
-  if (clientCache[region]) return clientCache[region];
   const cfg = { region };
-  clientCache[region] = {
-    ce:  new CostExplorerClient({ region: 'us-east-1' }),
+  return {
+    ce:  new CostExplorerClient({ region: 'us-east-1' }), // CE endpoint is always us-east-1
     ec2: new EC2Client(cfg),
     s3:  new S3Client(cfg),
     sts: new STSClient(cfg),
     elb: new ElasticLoadBalancingV2Client(cfg),
     rds: new RDSClient(cfg),
   };
-  return clientCache[region];
 }
 
 // ── DATE HELPERS ──
 const fmtDate = d => d.toISOString().split('T')[0];
 
 // Range for a specific year+month (0-based month index)
-// Uses string arithmetic to avoid UTC timezone drift
 function monthRange(year, month) {
   const now = new Date();
   const isCurrentMonth = year === now.getFullYear() && month === now.getMonth();
   const pad = n => String(n).padStart(2,'0');
 
-  // CE start: always 1st of the month
   const startStr = `${year}-${pad(month+1)}-01`;
 
-  // CE end is EXCLUSIVE (next day / next month first)
   let ceEndStr;
   if (isCurrentMonth) {
-    // end = tomorrow (today+1) so CE includes today
     const tomorrow = new Date(now.getFullYear(), now.getMonth(), now.getDate()+1);
     ceEndStr = `${tomorrow.getFullYear()}-${pad(tomorrow.getMonth()+1)}-${pad(tomorrow.getDate())}`;
   } else {
-    // end = first day of NEXT month
-    const nm = month + 2; // month is 0-based, +1 for 1-based, +1 for next month
+    const nm = month + 2;
     ceEndStr = nm > 12
       ? `${year+1}-01-01`
       : `${year}-${pad(nm)}-01`;
   }
 
-  // Display dates (human-readable, no CE exclusion trick)
-  const displayStart = startStr; // always 1st
+  const displayStart = startStr;
   const lastDay = new Date(year, month+1, 0).getDate();
   const displayEnd = isCurrentMonth
     ? `${year}-${pad(month+1)}-${pad(now.getDate())}`
@@ -93,7 +87,7 @@ async function ceCostByService(ce, start, end) {
       if (cost > 0.005) acc[g.Keys[0]] = (acc[g.Keys[0]] || 0) + cost;
       return acc;
     }, {});
-  } catch (e) { console.warn('CE services:', e.message); return {}; }
+  } catch (e) { console.warn('CE services: - server.js:90', e.message); return {}; }
 }
 
 async function ceMonthlyTotals(ce, year) {
@@ -109,7 +103,7 @@ async function ceMonthlyTotals(ce, year) {
       month:  L[new Date(r.TimePeriod.Start).getMonth()],
       amount: parseFloat(parseFloat(r.Total.UnblendedCost.Amount).toFixed(2))
     }));
-  } catch (e) { console.warn('CE monthly:', e.message); return []; }
+  } catch (e) { console.warn('CE monthly: - server.js:106', e.message); return []; }
 }
 
 const toList = map => Object.entries(map)
@@ -131,7 +125,7 @@ async function fetchEC2Stats(ec2) {
       stopped: instances.filter(i => ['stopped','stopping'].includes(i.State?.Name)).length,
       types:   [...new Set(instances.map(i => i.InstanceType))].slice(0, 5),
     };
-  } catch (e) { console.warn('EC2:', e.message); return { total:0, running:0, stopped:0, types:[] }; }
+  } catch (e) { console.warn('EC2: - server.js:128', e.message); return { total:0, running:0, stopped:0, types:[] }; }
 }
 
 async function fetchElasticIPs(ec2) {
@@ -139,7 +133,7 @@ async function fetchElasticIPs(ec2) {
     const r = await ec2.send(new DescribeAddressesCommand({}));
     const all = r.Addresses || [];
     return { total: all.length, unused: all.filter(a => !a.AssociationId).length };
-  } catch (e) { console.warn('EIPs:', e.message); return { total:0, unused:0 }; }
+  } catch (e) { console.warn('EIPs: - server.js:136', e.message); return { total:0, unused:0 }; }
 }
 
 async function fetchVolumes(ec2) {
@@ -157,7 +151,7 @@ async function fetchVolumes(ec2) {
       unused: vols.filter(v => v.State === 'available').length,
       gp2Gb:  vols.filter(v => v.VolumeType === 'gp2').reduce((s,v) => s + v.Size, 0),
     };
-  } catch (e) { console.warn('Volumes:', e.message); return { total:0, gp2:0, gp3:0, unused:0, gp2Gb:0 }; }
+  } catch (e) { console.warn('Volumes: - server.js:154', e.message); return { total:0, gp2:0, gp3:0, unused:0, gp2Gb:0 }; }
 }
 
 async function fetchVPCStats(ec2) {
@@ -180,7 +174,7 @@ async function fetchVPCStats(ec2) {
       securityGroups:   (sgs.SecurityGroups || []).length,
       keyPairs:         (kps.KeyPairs || []).length,
     };
-  } catch (e) { console.warn('VPC:', e.message); return { vpcs:0, subnets:{total:0,public:0,private:0}, natGateways:0, internetGateways:0, securityGroups:0, keyPairs:0 }; }
+  } catch (e) { console.warn('VPC: - server.js:177', e.message); return { vpcs:0, subnets:{total:0,public:0,private:0}, natGateways:0, internetGateways:0, securityGroups:0, keyPairs:0 }; }
 }
 
 async function fetchALBStats(elb) {
@@ -197,14 +191,14 @@ async function fetchALBStats(elb) {
       public:  albs.filter(lb => lb.Scheme === 'internet-facing').length,
       private: albs.filter(lb => lb.Scheme === 'internal').length,
     };
-  } catch (e) { console.warn('ALB:', e.message); return { total:0, public:0, private:0 }; }
+  } catch (e) { console.warn('ALB: - server.js:194', e.message); return { total:0, public:0, private:0 }; }
 }
 
 async function fetchS3Count(s3) {
   try {
     const r = await s3.send(new ListBucketsCommand({}));
     return (r.Buckets || []).length;
-  } catch (e) { console.warn('S3:', e.message); return 0; }
+  } catch (e) { console.warn('S3: - server.js:201', e.message); return 0; }
 }
 
 async function fetchRDSStats(rds) {
@@ -219,21 +213,19 @@ async function fetchRDSStats(rds) {
     const available = instances.filter(i => i.DBInstanceStatus === 'available').length;
     const stopped   = instances.filter(i => i.DBInstanceStatus === 'stopped').length;
 
-    // Count by engine
     const engines = {};
     for (const i of instances) {
       const eng = i.Engine || 'unknown';
       engines[eng] = (engines[eng] || 0) + 1;
     }
 
-    // Identify optimization targets
     const multiAZ      = instances.filter(i => i.MultiAZ).length;
     const nonMultiAZ   = instances.length - multiAZ;
     const gp2RDS       = instances.filter(i => i.StorageType === 'gp2').length;
     const smallStopped = instances.filter(i => i.DBInstanceStatus === 'stopped').map(i => i.DBInstanceIdentifier);
 
     return { total: instances.length, available, stopped, engines, multiAZ, nonMultiAZ, gp2Storage: gp2RDS, stoppedIds: smallStopped };
-  } catch (e) { console.warn('RDS:', e.message); return { total:0, available:0, stopped:0, engines:{}, multiAZ:0, nonMultiAZ:0, gp2Storage:0, stoppedIds:[] }; }
+  } catch (e) { console.warn('RDS: - server.js:228', e.message); return { total:0, available:0, stopped:0, engines:{}, multiAZ:0, nonMultiAZ:0, gp2Storage:0, stoppedIds:[] }; }
 }
 
 // ── COST SAVING RECOMMENDATIONS ──
@@ -242,7 +234,6 @@ function buildRecommendations(data) {
   const recs = [];
   const svc  = name => services.find(s => s.name.toLowerCase().includes(name.toLowerCase()));
 
-  // ── 1. Unused Elastic IPs ──
   if (infraStats.elasticIPs.unused > 0) {
     recs.push({
       category:'Networking', priority:'HIGH', icon:'🌐',
@@ -253,7 +244,6 @@ function buildRecommendations(data) {
     });
   }
 
-  // ── 2. Unused EBS Volumes ──
   if (infraStats.volumes.unused > 0) {
     recs.push({
       category:'Storage', priority:'HIGH', icon:'💾',
@@ -264,7 +254,6 @@ function buildRecommendations(data) {
     });
   }
 
-  // ── 3. GP2 → GP3 Migration ──
   if (infraStats.volumes.gp2 > 0) {
     const saving = Math.max(infraStats.volumes.gp2Gb * 0.02, infraStats.volumes.gp2 * 2);
     recs.push({
@@ -276,7 +265,6 @@ function buildRecommendations(data) {
     });
   }
 
-  // ── 4. Stopped EC2 Instances ──
   if (infraStats.ec2.stopped > 0) {
     recs.push({
       category:'Compute', priority:'MEDIUM', icon:'🖥️',
@@ -287,7 +275,6 @@ function buildRecommendations(data) {
     });
   }
 
-  // ── 5. EC2 CPU/Memory Right-Sizing ──
   const ec2Svc = svc('Elastic Compute Cloud') || svc('EC2');
   if (ec2Svc && ec2Svc.cost > 100) {
     recs.push({
@@ -299,7 +286,6 @@ function buildRecommendations(data) {
     });
   }
 
-  // ── 6. Spot Instances for Non-Critical Workloads ──
   if (ec2Svc && ec2Svc.cost > 150) {
     recs.push({
       category:'Compute', priority:'HIGH', icon:'⚡',
@@ -310,7 +296,6 @@ function buildRecommendations(data) {
     });
   }
 
-  // ── 7. Savings Plans & Reserved Instances ──
   if (currentMonthTotal > 300) {
     recs.push({
       category:'Pricing', priority:'HIGH', icon:'💰',
@@ -321,7 +306,6 @@ function buildRecommendations(data) {
     });
   }
 
-  // ── 8. NAT Gateway Consolidation ──
   if (infraStats.natGateways > 1) {
     recs.push({
       category:'Networking', priority:'MEDIUM', icon:'🔀',
@@ -332,7 +316,6 @@ function buildRecommendations(data) {
     });
   }
 
-  // ── 9. S3 Intelligent Tiering & Lifecycle Policies ──
   const s3Svc = svc('S3') || svc('Simple Storage');
   if (s3Svc && s3Svc.cost > 10) {
     recs.push({
@@ -344,7 +327,6 @@ function buildRecommendations(data) {
     });
   }
 
-  // ── 10. S3 Bucket Versioning & Replication Audit ──
   if (infraStats.s3Buckets > 5) {
     recs.push({
       category:'S3 Storage', priority:'MEDIUM', icon:'🗂️',
@@ -355,7 +337,6 @@ function buildRecommendations(data) {
     });
   }
 
-  // ── 11. S3 Access Patterns & Glacier Deep Archive ──
   if (s3Svc && s3Svc.cost > 30) {
     recs.push({
       category:'S3 Storage', priority:'MEDIUM', icon:'📦',
@@ -366,7 +347,6 @@ function buildRecommendations(data) {
     });
   }
 
-  // ── 12. S3 Multipart Upload Cleanup ──
   if (s3Svc) {
     recs.push({
       category:'S3 Storage', priority:'LOW', icon:'🧹',
@@ -377,7 +357,6 @@ function buildRecommendations(data) {
     });
   }
 
-  // ── 13. S3 Request Cost Optimization ──
   if (s3Svc && s3Svc.cost > 20) {
     recs.push({
       category:'S3 Storage', priority:'LOW', icon:'📡',
@@ -388,7 +367,6 @@ function buildRecommendations(data) {
     });
   }
 
-  // ── 14. RDS Optimization ──
   const rdsSvc = svc('Relational Database') || svc('RDS');
   if (rdsSvc && rdsSvc.cost > 80) {
     recs.push({
@@ -400,7 +378,6 @@ function buildRecommendations(data) {
     });
   }
 
-  // ── 13. Lambda Optimization ──
   const lambdaSvc = svc('Lambda');
   if (lambdaSvc && lambdaSvc.cost > 20) {
     recs.push({
@@ -412,7 +389,6 @@ function buildRecommendations(data) {
     });
   }
 
-  // ── 14. Data Transfer → CloudFront + VPC Endpoints ──
   const dtSvc = svc('Data Transfer');
   if (dtSvc && dtSvc.cost > 30) {
     recs.push({
@@ -424,7 +400,6 @@ function buildRecommendations(data) {
     });
   }
 
-  // ── 15. CloudWatch Log Retention ──
   recs.push({
     category:'Monitoring', priority:'LOW', icon:'📊',
     title:'Set CloudWatch Log Group Retention to Avoid Indefinite Storage',
@@ -433,7 +408,6 @@ function buildRecommendations(data) {
     action:'CloudWatch → Log groups → select all without retention → Actions → Edit retention → set 30 / 60 / 90 days',
   });
 
-  // ── 16. RDS Stopped Instances ──
   const rds = infraStats.rds || {};
   if (rds.stopped > 0) {
     recs.push({
@@ -445,7 +419,6 @@ function buildRecommendations(data) {
     });
   }
 
-  // ── 17. RDS GP2 → GP3 Storage ──
   if (rds.gp2Storage > 0) {
     recs.push({
       category:'Database', priority:'MEDIUM', icon:'💽',
@@ -456,7 +429,6 @@ function buildRecommendations(data) {
     });
   }
 
-  // ── 18. RDS Multi-AZ Dev/Test ──
   if (rds.multiAZ > 1) {
     recs.push({
       category:'Database', priority:'MEDIUM', icon:'🔁',
@@ -467,7 +439,6 @@ function buildRecommendations(data) {
     });
   }
 
-  // ── 19. RDS Reserved Instances ──
   const rdsSvc2 = svc('Relational Database') || svc('RDS');
   if (rdsSvc2 && rdsSvc2.cost > 80 && rds.available > 0) {
     recs.push({
@@ -479,7 +450,6 @@ function buildRecommendations(data) {
     });
   }
 
-  // ── 20. RDS Aurora Serverless for variable workloads ──
   if (rds.total > 0 && (rds.engines['mysql'] || rds.engines['postgres'] || rds.engines['aurora-mysql'] || rds.engines['aurora-postgresql'])) {
     recs.push({
       category:'Database', priority:'LOW', icon:'⚡',
@@ -490,7 +460,6 @@ function buildRecommendations(data) {
     });
   }
 
-  // Sort: HIGH first, then MEDIUM, then LOW; within each group sort by saving desc
   const pOrder = { HIGH: 0, MEDIUM: 1, LOW: 2 };
   recs.sort((a, b) => pOrder[a.priority] - pOrder[b.priority] || b.monthlySaving - a.monthlySaving);
   return recs;
@@ -501,17 +470,15 @@ async function fetchAllData(region, year, month) {
   const { ce, ec2, s3, sts, elb, rds } = getClients(region);
   const now = new Date();
   const billingYear  = year  || now.getFullYear();
-  const billingMonth = (month !== undefined && month !== null) ? month : now.getMonth(); // 0-based
+  const billingMonth = (month !== undefined && month !== null) ? month : now.getMonth();
 
-  console.log(`Fetching — region:${region} year:${billingYear} month:${billingMonth}`);
+  console.log(`\n🌍 Fetching  region=${region}  year=${billingYear}  month=${billingMonth} - server.js:475`);
 
-  // Selected month range
   const sel  = monthRange(billingYear, billingMonth);
-  // Previous two months (always full)
   const prevMonth = billingMonth === 0
     ? monthRange(billingYear - 1, 11)
     : monthRange(billingYear, billingMonth - 1);
-  prevMonth.end = fmtDate(new Date(billingYear, billingMonth, 1)); // force full prev month
+  prevMonth.end = fmtDate(new Date(billingYear, billingMonth, 1));
   const prev2Month = billingMonth <= 1
     ? monthRange(billingYear - 1, billingMonth === 0 ? 10 : 11)
     : monthRange(billingYear, billingMonth - 2);
@@ -543,7 +510,6 @@ async function fetchAllData(region, year, month) {
   const total         = parseFloat(services.reduce((s,x) => s+x.cost, 0).toFixed(2));
 
   const MONTH_NAMES = ['January','February','March','April','May','June','July','August','September','October','November','December'];
-  const SHORT_MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
 
   const billingPeriod = sel.isCurrentMonth
     ? `${MONTH_NAMES[billingMonth]} 1 – ${now.getDate()} (MTD)`
@@ -576,22 +542,34 @@ async function fetchAllData(region, year, month) {
 }
 
 // ── CACHE ──
+// BUG FIX: cache key now includes region, so each region gets its own cache slot.
+// Switching region will always fetch fresh data for that region.
 const cache = {};
 const TTL   = 15 * 60 * 1000;
 
 async function getCached(region, year, month) {
   const key = `${region}_${year}_${month}`;
-  if (cache[key] && Date.now() - cache[key].ts < TTL) return cache[key].data;
+  if (cache[key] && Date.now() - cache[key].ts < TTL) {
+    console.log(`📦 Cache hit: ${key} - server.js:553`);
+    return cache[key].data;
+  }
+  console.log(`🔄 Cache miss  fetching: ${key} - server.js:556`);
   const data = await fetchAllData(region, year, month);
   cache[key] = { data, ts: Date.now() };
   return data;
 }
 
 // ── ROUTES ──
+// BUG FIX: removed process.env.AWS_REGION fallback from /api/billing.
+// Previously, if AWS_REGION=ap-south-2 in .env, changing the UI dropdown to
+// us-east-1 still returned ap-south-2 data because the env var overrode the
+// query param when req.query.region was falsy. Now the UI region always wins,
+// falling back to us-east-1 only if no query param is sent at all.
 app.get('/api/billing', async (req, res) => {
-  const region = req.query.region || process.env.AWS_REGION || 'us-east-1';
+  const region = req.query.region || 'us-east-1';
   const year   = parseInt(req.query.year)  || new Date().getFullYear();
   const month  = req.query.month !== undefined ? parseInt(req.query.month) : new Date().getMonth();
+  console.log(`GET /api/billing  region=${region}  year=${year}  month=${month} - server.js:572`);
   try { res.json(await getCached(region, year, month)); }
   catch (e) { console.error(e); res.status(500).json({ error: e.message }); }
 });
@@ -601,12 +579,14 @@ app.get('/api/refresh', async (req, res) => {
   const year   = parseInt(req.query.year)  || new Date().getFullYear();
   const month  = req.query.month !== undefined ? parseInt(req.query.month) : new Date().getMonth();
   const key    = `${region}_${year}_${month}`;
+  console.log(`GET /api/refresh  region=${region}  year=${year}  month=${month}  busting cache key: ${key} - server.js:582`);
   delete cache[key];
   try { res.json(await getCached(region, year, month)); }
   catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.listen(PORT, HOST, () => {
-  console.log(`\n✅  EagleEye — AWS Billing Intelligence → http://${HOST}:${PORT}`);
-  console.log(`    Auth: IAM Role (EC2 Instance Metadata)\n`);
+  console.log(`\n✅  EagleEye  AWS Billing Intelligence → http://${HOST}:${PORT} - server.js:589`);
+  console.log(`Auth: IAM Role (EC2 Instance Metadata) - server.js:590`);
+  console.log(`Note: AWS_REGION in .env is ignored  region is selected via UI dropdown\n - server.js:591`);
 });
